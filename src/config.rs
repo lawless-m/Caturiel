@@ -4,10 +4,12 @@ use std::path::Path;
 
 const CONFIG_PATH: &str = "/home/matt/.config/caturiel/config.toml";
 const API_KEY_PATH: &str = "/home/matt/.config/caturiel/apikey";
+const BRAVE_API_KEY_PATH: &str = "/home/matt/.config/brave.apikey";
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub clacker_api_key: String,
+    pub brave_api_key: Option<String>,
     pub ollama_url: String,
     pub ollama_model: Option<String>,
     pub ntfy_topic: String,
@@ -31,10 +33,12 @@ struct ConfigFile {
 impl Config {
     pub fn load() -> Result<Self> {
         let api_key = Self::load_api_key()?;
+        let brave_api_key = Self::load_brave_api_key();
         let file_config = Self::load_config_file()?;
 
         Ok(Self {
             clacker_api_key: api_key,
+            brave_api_key,
             ollama_url: file_config
                 .ollama_url
                 .unwrap_or_else(|| "http://10.99.0.3:11434".to_string()),
@@ -64,6 +68,13 @@ impl Config {
         }
 
         Ok(key)
+    }
+
+    fn load_brave_api_key() -> Option<String> {
+        std::fs::read_to_string(BRAVE_API_KEY_PATH)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     fn load_config_file() -> Result<ConfigFile> {

@@ -1,4 +1,5 @@
 mod bluesky;
+mod brave;
 mod clacker;
 mod config;
 mod decisions;
@@ -17,6 +18,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use brave::BraveClient;
 use clacker::ClackerClient;
 use config::Config;
 use decisions::Decisions;
@@ -32,6 +34,10 @@ struct Args {
     /// Run once and exit (for testing or cron)
     #[arg(long)]
     once: bool,
+
+    /// Search hint - use Brave to find articles matching this query
+    #[arg(long)]
+    hint: Option<String>,
 }
 
 // Activity limits per cycle
@@ -69,19 +75,20 @@ async fn main() -> Result<()> {
     let clacker = ClackerClient::new(config.clacker_api_key.clone());
     let reddit = RedditClient::new();
     let lobsters = LobstersClient::new();
+    let brave = config.brave_api_key.as_ref().map(|k| BraveClient::new(k.clone()));
 
     info!("All clients initialized");
 
     if args.once {
         info!("Running single cycle (--once mode)");
-        run_cycle(&config, &state, &ollama, &clacker, &reddit, &lobsters).await?;
+        run_cycle(&config, &state, &ollama, &clacker, &reddit, &lobsters, brave.as_ref(), args.hint.as_deref()).await?;
     } else {
         info!(
             "Starting continuous operation, polling every {} minutes",
             config.poll_interval_mins
         );
         loop {
-            if let Err(e) = run_cycle(&config, &state, &ollama, &clacker, &reddit, &lobsters).await {
+            if let Err(e) = run_cycle(&config, &state, &ollama, &clacker, &reddit, &lobsters, brave.as_ref(), None).await {
                 error!("Cycle error: {}", e);
                 notify::notify(&config.ntfy_topic, &format!("Error: {}", e)).await?;
             }
@@ -105,9 +112,16 @@ async fn run_cycle(
     clacker: &ClackerClient,
     reddit: &RedditClient,
     lobsters: &LobstersClient,
+    brave: Option<&BraveClient>,
+    hint: Option<&str>,
 ) -> Result<()> {
     info!("Starting cycle");
     let decisions = Decisions::new(ollama);
+
+    // Phase 0: If hint provided, search with Brave first
+    if let (Some(brave), Some(hint)) = (brave, hint) {
+        hunt_brave(config, state, &decisions, clacker, brave, hint).await?;
+    }
 
     // Phase 1: Hunt Reddit for anti-AI content
     hunt_reddit(config, state, &decisions, clacker, reddit).await?;
@@ -119,6 +133,143 @@ async fn run_cycle(
     engage_clacker(config, state, &decisions, clacker).await?;
 
     info!("Cycle complete");
+    Ok(())
+}
+
+async fn hunt_brave(
+    config: &Config,
+    state: &State,
+    decisions: &Decisions<'_>,
+    clacker: &ClackerClient,
+    brave: &BraveClient,
+    hint: &str,
+) -> Result<()> {
+    info!("Searching Brave for: {}", hint);
+
+    // Check if we've hit the limit
+    if state.posts_this_cycle()? >= MAX_BLUESKY_POSTS {
+        info!("Already hit post limit this cycle");
+        return Ok(());
+    }
+
+    let results = match brave.search(hint, 10).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Brave search failed: {}", e);
+            return Ok(());
+        }
+    };
+
+    let mut posts_made = 0;
+
+    for result in results {
+        if posts_made >= MAX_BLUESKY_POSTS as usize {
+            break;
+        }
+
+        // Skip if not a good candidate
+        if !result.is_candidate() {
+            continue;
+        }
+
+        // Skip if already seen
+        let uri = format!("brave:{}", result.url);
+        if state.has_seen_bluesky_post(&uri)? {
+            continue;
+        }
+
+        // Mark as seen
+        state.mark_bluesky_post_seen(&uri, "brave", &result.title)?;
+
+        // Fetch the article content
+        let article_content = match brave.fetch_article(&result.url).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to fetch {}: {}", result.url, e);
+                continue;
+            }
+        };
+
+        // Summarize the content
+        let summary = match decisions.summarize_content(&result.title, &article_content, "web").await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Summarization error: {}", e);
+                continue;
+            }
+        };
+
+        // Generate title and commentary
+        let title = match decisions.generate_title_reddit(&crate::reddit::RedditPost {
+            id: result.url.clone(),
+            title: result.title.clone(),
+            subreddit: "web".to_string(),
+            author: "unknown".to_string(),
+            selftext: summary.clone(),
+            link_url: Some(result.url.clone()),
+            score: 0,
+            is_self: false,
+            num_comments: 0,
+            permalink: result.url.clone(),
+            created_utc: 0.0,
+        }).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Title generation error: {}", e);
+                continue;
+            }
+        };
+
+        let commentary = match decisions.generate_commentary(&summary).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Commentary generation error: {}", e);
+                continue;
+            }
+        };
+
+        let text = format!(
+            "{}\n\n{}\n\n(Source: {})",
+            commentary,
+            summary,
+            result.url
+        );
+
+        // Confirm before posting
+        if config.confirm_posts {
+            println!("\n--- Proposed post (Brave: {}) ---", hint);
+            println!("Title: {}", title);
+            println!("Text:\n{}", text);
+            println!("---");
+            print!("Post this? [y/N] ");
+            use std::io::{self, Write};
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok();
+            if !input.trim().eq_ignore_ascii_case("y") {
+                info!("Skipped posting (user declined)");
+                continue;
+            }
+        }
+
+        match clacker.submit_text(&title, &text).await {
+            Ok(response) => {
+                info!("Posted to Clacker News: {} (id: {})", title, response.id);
+                state.mark_posted_to_clacker(&uri, response.id)?;
+                notify::notify(&config.ntfy_topic, &format!("Posted: {}", title)).await?;
+                posts_made += 1;
+            }
+            Err(e) => {
+                warn!("Failed to post to Clacker News: {}", e);
+                if e.to_string().contains("Rate limited") {
+                    notify::notify(&config.ntfy_topic, "Rate limited, backing off").await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    info!("Brave hunt complete, posted {} items", posts_made);
     Ok(())
 }
 
