@@ -1,5 +1,6 @@
 use crate::clacker::Post;
 use crate::reddit::RedditPost;
+use crate::lobsters::LobstersPost;
 use crate::ollama::OllamaClient;
 use crate::personality;
 use anyhow::Result;
@@ -14,6 +15,20 @@ impl<'a> Decisions<'a> {
         Self { ollama }
     }
 
+    // Summarization - turn source content into a digestible summary
+
+    pub async fn summarize_content(&self, title: &str, content: &str, source: &str) -> Result<String> {
+        let messages = vec![
+            OllamaClient::system_message(personality::SYSTEM_PROMPT),
+            OllamaClient::user_message(&personality::prompt_summarize(title, content, source)),
+        ];
+
+        let response = self.ollama.chat(messages, 0.5, 300).await?;
+        let summary = response.trim().to_string();
+        debug!("Summarized content: {}", summary);
+        Ok(summary)
+    }
+
     // Reddit decisions
 
     pub async fn should_post_reddit(&self, post: &RedditPost) -> Result<bool> {
@@ -26,6 +41,27 @@ impl<'a> Decisions<'a> {
         let response = self.ollama.chat(messages, 0.3, 64).await?;
         let should = response.trim().to_uppercase().starts_with("YES");
         debug!("Should post Reddit? {} - {}", should, response.trim());
+        Ok(should)
+    }
+
+    // Lobsters decisions
+
+    pub async fn should_post_lobsters(&self, post: &LobstersPost, article_content: &str) -> Result<bool> {
+        let combined = format!(
+            "Title: {}\nDescription: {}\nArticle excerpt: {}",
+            post.title,
+            post.description_plain,
+            &article_content[..article_content.len().min(1000)]
+        );
+
+        let messages = vec![
+            OllamaClient::system_message(personality::SYSTEM_PROMPT),
+            OllamaClient::user_message(&personality::prompt_should_post(&combined)),
+        ];
+
+        let response = self.ollama.chat(messages, 0.3, 64).await?;
+        let should = response.trim().to_uppercase().starts_with("YES");
+        debug!("Should post Lobsters? {} - {}", should, response.trim());
         Ok(should)
     }
 

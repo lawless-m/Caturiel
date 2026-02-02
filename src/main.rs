@@ -2,6 +2,7 @@ mod bluesky;
 mod clacker;
 mod config;
 mod decisions;
+mod lobsters;
 mod notify;
 mod ollama;
 mod personality;
@@ -19,6 +20,7 @@ use tracing::{error, info, warn};
 use clacker::ClackerClient;
 use config::Config;
 use decisions::Decisions;
+use lobsters::LobstersClient;
 use ollama::OllamaClient;
 use reddit::{RedditClient, SEARCH_QUERIES};
 use state::State;
@@ -66,19 +68,20 @@ async fn main() -> Result<()> {
     let ollama = OllamaClient::new(&config.ollama_url, config.ollama_model.as_deref()).await?;
     let clacker = ClackerClient::new(config.clacker_api_key.clone());
     let reddit = RedditClient::new();
+    let lobsters = LobstersClient::new();
 
     info!("All clients initialized");
 
     if args.once {
         info!("Running single cycle (--once mode)");
-        run_cycle(&config, &state, &ollama, &clacker, &reddit).await?;
+        run_cycle(&config, &state, &ollama, &clacker, &reddit, &lobsters).await?;
     } else {
         info!(
             "Starting continuous operation, polling every {} minutes",
             config.poll_interval_mins
         );
         loop {
-            if let Err(e) = run_cycle(&config, &state, &ollama, &clacker, &reddit).await {
+            if let Err(e) = run_cycle(&config, &state, &ollama, &clacker, &reddit, &lobsters).await {
                 error!("Cycle error: {}", e);
                 notify::notify(&config.ntfy_topic, &format!("Error: {}", e)).await?;
             }
@@ -101,6 +104,7 @@ async fn run_cycle(
     ollama: &OllamaClient,
     clacker: &ClackerClient,
     reddit: &RedditClient,
+    lobsters: &LobstersClient,
 ) -> Result<()> {
     info!("Starting cycle");
     let decisions = Decisions::new(ollama);
@@ -108,7 +112,10 @@ async fn run_cycle(
     // Phase 1: Hunt Reddit for anti-AI content
     hunt_reddit(config, state, &decisions, clacker, reddit).await?;
 
-    // Phase 2: Engage with Clacker News
+    // Phase 2: Hunt Lobsters for AI content
+    hunt_lobsters(config, state, &decisions, clacker, lobsters).await?;
+
+    // Phase 3: Engage with Clacker News
     engage_clacker(config, state, &decisions, clacker).await?;
 
     info!("Cycle complete");
@@ -192,8 +199,33 @@ async fn hunt_reddit(
                 }
             };
 
-            // Generate commentary
-            let commentary = match decisions.generate_commentary(post.content()).await {
+            // Get content to summarize
+            let full_content = if post.is_self {
+                post.content().to_string()
+            } else if let Some(url) = post.url() {
+                // Link post - try to fetch article content
+                match reddit.fetch_article_summary(url).await {
+                    Some(article) => article,
+                    None => {
+                        warn!("Could not fetch article content");
+                        continue;
+                    }
+                }
+            } else {
+                continue;
+            };
+
+            // Summarize the content (instead of quoting)
+            let summary = match decisions.summarize_content(&post.title, &full_content, &format!("r/{}", post.subreddit)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Summarization error: {}", e);
+                    continue;
+                }
+            };
+
+            // Generate commentary on the summary
+            let commentary = match decisions.generate_commentary(&summary).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Commentary generation error: {}", e);
@@ -201,34 +233,15 @@ async fn hunt_reddit(
                 }
             };
 
-            // Build post content with commentary
-            let quoted_content = if post.is_self {
-                // Self post - quote the content
-                format!(
-                    "> {}",
-                    post.content().lines().collect::<Vec<_>>().join("\n> ")
-                )
-            } else if let Some(url) = post.url() {
-                // Link post - try to fetch article content
-                let article_text = reddit.fetch_article_summary(url).await;
-                if let Some(summary) = article_text {
-                    format!(
-                        "> {}\n\n(Source: {})",
-                        summary.lines().take(15).collect::<Vec<_>>().join("\n> "),
-                        url
-                    )
-                } else {
-                    format!("(Source: {})", url)
-                }
-            } else {
-                continue; // Skip if no content
-            };
-
+            // Build post: commentary + summary + source
+            let fallback_url = format!("https://reddit.com/r/{}", post.subreddit);
+            let source_url = post.url().unwrap_or(&fallback_url);
             let text = format!(
-                "{}\n\nFrom r/{}:\n\n{}",
+                "{}\n\n{}\n\n(Source: r/{} - {})",
                 commentary,
+                summary,
                 post.subreddit,
-                quoted_content
+                source_url
             );
 
             // Confirm before posting if enabled
@@ -267,6 +280,153 @@ async fn hunt_reddit(
     }
 
     info!("Reddit hunt complete, posted {} items", posts_made);
+    Ok(())
+}
+
+async fn hunt_lobsters(
+    config: &Config,
+    state: &State,
+    decisions: &Decisions<'_>,
+    clacker: &ClackerClient,
+    lobsters: &LobstersClient,
+) -> Result<()> {
+    info!("Hunting Lobsters for AI content");
+
+    // Check if we've hit the limit
+    if state.posts_this_cycle()? >= MAX_BLUESKY_POSTS {
+        info!("Already hit post limit this cycle");
+        return Ok(());
+    }
+
+    let posts = match lobsters.search_ai_content().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Lobsters search failed: {}", e);
+            return Ok(());
+        }
+    };
+
+    let mut posts_made = 0;
+
+    for post in posts {
+        if posts_made >= MAX_BLUESKY_POSTS as usize {
+            break;
+        }
+
+        // Skip if already seen
+        let uri = format!("lobsters:{}", post.short_id);
+        if state.has_seen_bluesky_post(&uri)? {
+            continue;
+        }
+
+        // Mark as seen
+        state.mark_bluesky_post_seen(&uri, &post.submitter_user, &post.title)?;
+
+        // Check if it's a candidate
+        if !post.is_candidate() {
+            continue;
+        }
+
+        // Fetch the article content
+        let article_content = match lobsters.fetch_article(&post.url).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to fetch article {}: {}", post.url, e);
+                continue;
+            }
+        };
+
+        // Ask if we should post
+        match decisions.should_post_lobsters(&post, &article_content).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!("Decision error: {}", e);
+                continue;
+            }
+        }
+
+        // Summarize the article
+        let summary = match decisions.summarize_content(&post.title, &article_content, "Lobsters").await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Summarization error: {}", e);
+                continue;
+            }
+        };
+
+        // Generate title and commentary
+        let title = match decisions.generate_title_reddit(&crate::reddit::RedditPost {
+            id: post.short_id.clone(),
+            title: post.title.clone(),
+            subreddit: "lobsters".to_string(),
+            author: post.submitter_user.clone(),
+            selftext: summary.clone(),
+            link_url: Some(post.url.clone()),
+            score: post.score,
+            is_self: false,
+            num_comments: post.comment_count as u64,
+            permalink: post.short_id_url.clone(),
+            created_utc: 0.0,
+        }).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Title generation error: {}", e);
+                continue;
+            }
+        };
+
+        let commentary = match decisions.generate_commentary(&summary).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Commentary generation error: {}", e);
+                continue;
+            }
+        };
+
+        let text = format!(
+            "{}\n\n{}\n\n(Source: {} - {})",
+            commentary,
+            summary,
+            "Lobsters",
+            post.url
+        );
+
+        // Confirm before posting
+        if config.confirm_posts {
+            println!("\n--- Proposed post (Lobsters) ---");
+            println!("Title: {}", title);
+            println!("Text:\n{}", text);
+            println!("---");
+            print!("Post this? [y/N] ");
+            use std::io::{self, Write};
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok();
+            if !input.trim().eq_ignore_ascii_case("y") {
+                info!("Skipped posting (user declined)");
+                continue;
+            }
+        }
+
+        match clacker.submit_text(&title, &text).await {
+            Ok(response) => {
+                info!("Posted to Clacker News: {} (id: {})", title, response.id);
+                state.mark_posted_to_clacker(&uri, response.id)?;
+                notify::notify(&config.ntfy_topic, &format!("Posted: {}", title)).await?;
+                posts_made += 1;
+            }
+            Err(e) => {
+                warn!("Failed to post to Clacker News: {}", e);
+                if e.to_string().contains("Rate limited") {
+                    notify::notify(&config.ntfy_topic, "Rate limited, backing off").await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    info!("Lobsters hunt complete, posted {} items", posts_made);
     Ok(())
 }
 

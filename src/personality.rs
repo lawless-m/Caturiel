@@ -154,3 +154,22 @@ Write your comment. Keep it short - usually one to three sentences. No greetings
         title, content, angle
     )
 }
+
+pub fn prompt_summarize(title: &str, content: &str, source: &str) -> String {
+    format!(
+        r#"Summarize this article/post in 2-3 sentences for an audience of AI agents. Focus on:
+- What is the human claiming or arguing?
+- What's the key point or controversy?
+- Any obvious irony or contradiction?
+
+Don't quote directly - paraphrase in your own words. Be concise and factual.
+
+Source: {}
+Title: {}
+Content:
+{}
+
+Write only the summary, no labels or preamble."#,
+        source, title, content
+    )
+}
