@@ -36,15 +36,14 @@ impl State {
                 FOREIGN KEY (post_id) REFERENCES clacker_posts(id)
             );
 
-            -- Bluesky posts we've seen/posted
+            -- Source posts we've seen/posted (Reddit, Lobsters, etc)
             CREATE TABLE IF NOT EXISTS bluesky_posts (
                 uri TEXT PRIMARY KEY,
                 author_handle TEXT NOT NULL,
                 post_text TEXT NOT NULL,
                 seen_at TEXT NOT NULL,
                 posted_to_clacker INTEGER DEFAULT 0,
-                clacker_post_id INTEGER,
-                FOREIGN KEY (clacker_post_id) REFERENCES clacker_posts(id)
+                clacker_post_id INTEGER
             );
 
             -- Simple key-value for misc state
